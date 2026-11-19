@@ -1,13 +1,4 @@
-#!/usr/bin/env python3
-"""Phase 1 Step 7: resolve taxonomy, aggregate exact-TaxID locus counts.
-
-Input tables come from Steps 5 and 6. This script never modifies them.
-Missing (accession, locus) pairs in the sparse record_locus table mean absent.
-The build_info status totals count record-locus assessments, not distinct records.
-
-Use --mode local on the QCIF VM, or --mode ssh on a development computer.
-Run --check-only to validate the input database without building anything.
-"""
+# To Build TaxID-level locus counts using the existing DuckDB tables and NCBI taxonomy.
 
 import argparse
 import csv
@@ -169,7 +160,7 @@ def run_remote(args, remote_command):
 
 
 def taxonomy_environment(args):
-    """Return tool version and file signatures; signature prevents stale cache reuse."""
+    """Read TaxonKit and taxonomy file metadata for cache validation."""
     filenames = ("nodes.dmp", "names.dmp", "merged.dmp", "delnodes.dmp")
     if args.mode == "ssh":
         tool = shlex.quote(args.remote_taxonkit)
@@ -294,7 +285,7 @@ def verify_parsed(path, input_path, expected_rows):
 
 
 def parse_taxonkit_output(raw, parsed, input_path, expected_rows):
-    """Parse taxonkit lineage -c -t -R (five tab-delimited columns)."""
+    """Parse the five-column output from TaxonKit lineage -c -t -R."""
     with raw.open("r", encoding="utf-8-sig") as source, input_path.open(
         "r", encoding="utf-8"
     ) as ids, parsed.open("w", encoding="utf-8", newline="") as output:
@@ -444,7 +435,7 @@ def validate_rollup(db, stats):
 
 def build_tables(database, taxonomy_file, stats, args, statuses,
                  tool_version, dump_version):
-    """Build both output tables in one DuckDB transaction; rollback on any error."""
+    """Build taxid_locus and build_info in a single transaction."""
     db = duckdb.connect(str(database))
     in_transaction = False
     try:
@@ -480,6 +471,7 @@ def build_tables(database, taxonomy_file, stats, args, statuses,
         final = ", ".join(
             f"COALESCE(p.locus_{i}, 0)::BIGINT AS locus_{i}" for i in ids
         )
+        # Aggregate counts by the original TaxID; lineage fields support rank-level queries.
         db.execute("DROP TABLE IF EXISTS taxid_locus")
         db.execute(f"""
             CREATE TABLE taxid_locus AS
@@ -509,6 +501,7 @@ def build_tables(database, taxonomy_file, stats, args, statuses,
         db.execute("CREATE INDEX idx_taxid_locus_genus ON taxid_locus(rank_genus)")
         db.execute("CREATE INDEX idx_taxid_locus_species ON taxid_locus(rank_species)")
 
+        # Absent pairs are not stored in the sparse record_locus table.
         absent = stats["records"] * len(ids) - stats["present"] - stats["unknown"]
         if absent < 0:
             raise ValueError("Impossible absent-count calculation")
@@ -552,13 +545,13 @@ def build_tables(database, taxonomy_file, stats, args, statuses,
 def main():
     args = parse_arguments()
     database = validate_arguments(args)
-    print("Validating source tables and permanent Step 6 locus IDs...", flush=True)
+    print("Validating input tables and locus IDs...", flush=True)
     stats = validate_database(database)
     print(f"Records: {stats['records']:,} | distinct TaxIDs: {stats['taxids']:,} | "
           f"present pairs: {stats['present']:,} | unknown pairs: {stats['unknown']:,}",
           flush=True)
     if args.check_only:
-        print("CHECK ONLY PASSED: no tables or cache modified", flush=True)
+        print("Input validation complete (read-only mode)", flush=True)
         return
 
     work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else (
@@ -568,7 +561,7 @@ def main():
     print(f"TaxonKit execution: {args.mode}", flush=True)
     tool_version, signatures, dump_version = taxonomy_environment(args)
     print(f"TaxonKit: {tool_version} | taxdump: {dump_version}", flush=True)
-    print("Extracting distinct TaxIDs in bounded batches...", flush=True)
+    print("Reading distinct TaxIDs in batches...", flush=True)
     batches, count, taxid_digest = taxid_batches(database, work_dir, args.batch_size)
     if count != stats["taxids"]:
         raise ValueError("Distinct TaxID extraction count mismatch")
@@ -583,7 +576,7 @@ def main():
     check_cache(work_dir, manifest)
     parsed_files = []
     for number, input_path, rows in batches:
-        print(f"[{number}/{len(batches)}] Taxonomy batch...", flush=True)
+        print(f"Processing taxonomy batch {number}/{len(batches)}...", flush=True)
         parsed_files.append(run_taxonkit_batch(args, number, input_path, rows))
     taxonomy_file, total = join_taxonomy(work_dir, parsed_files)
     if total != count:
@@ -594,10 +587,10 @@ def main():
     print("Taxonomy resolution: " + ", ".join(
         f"{status}={statuses[status]:,}" for status in ("current", "merged", "deleted", "not_found")
     ), flush=True)
-    print("Building taxid_locus and build_info atomically...", flush=True)
+    print("Building taxid_locus and build_info...", flush=True)
     rows, absent = build_tables(database, taxonomy_file, stats, args, statuses,
                                 tool_version, dump_version)
-    print(f"STEP 7 COMPLETE: {rows:,} TaxID rows | "
+    print(f"Build complete: {rows:,} TaxID rows | "
           f"present pairs={stats['present']:,} | unknown pairs={stats['unknown']:,} | "
           f"absent pairs={absent:,}", flush=True)
     print(f"Cache: {work_dir}", flush=True)
